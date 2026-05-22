@@ -93,6 +93,7 @@ class GLGizmoCut3D : public GLGizmoBase
     GLModel m_snap_radii;
     GLModel m_reference_radius;
     GLModel m_angle_arc;
+    GLModel m_lp_outline;
 
     Vec3d   m_old_center;
     Vec3d   m_cut_normal;
@@ -128,7 +129,18 @@ class GLGizmoCut3D : public GLGizmoBase
     int m_groove_count_init { 1 };
     int m_groove_count { 1 };
     float m_groove_gap { 10.f }; // distance between multiple dovetail cuts
-    float m_groove_gap_init { 10.f }; 
+    float m_groove_gap_init { 10.f };
+
+    // Input params for Limited Planar cut. m_lp_size is set on mode entry by
+    // switch_to_mode() and by the Reset button — see those for the live default.
+    float  m_lp_size              {0.f};   // mm, half-width of the limited cut plane
+    float  m_lp_x_offset          {0.f};   // mm offset in plane-local X
+    float  m_lp_y_offset          {0.f};   // mm offset in plane-local Y
+    int    m_lp_section           {0};     // 0=both, 1=cut-off piece, 2=remaining piece
+    bool   m_lp_place_on_cut_upper{false}; // drop cut-off piece to build plate
+    bool   m_lp_place_on_cut_lower{false}; // drop remaining piece to build plate
+
+    std::vector<std::string> m_lp_section_names;
 
     // Input params for cut with snaps
     float m_snap_bulge_proportion{ 0.15f };
@@ -214,6 +226,7 @@ class GLGizmoCut3D : public GLGizmoBase
     enum class CutMode {
         cutPlanar
         , cutTongueAndGroove
+        , cutLimitedPlanar
         //, cutGrig
         //,cutRadial
         //,cutModular

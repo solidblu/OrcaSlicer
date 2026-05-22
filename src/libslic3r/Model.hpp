@@ -242,7 +242,8 @@ private:
 
 enum class CutMode : int {
     cutPlanar,
-    cutTongueAndGroove
+    cutTongueAndGroove,
+    cutLimitedPlanar
 };
 
 enum class CutConnectorType : int {

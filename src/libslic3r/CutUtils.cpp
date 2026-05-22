@@ -3,6 +3,7 @@
 #include "Geometry.hpp"
 #include "libslic3r.h"
 #include "Model.hpp"
+#include "MeshBoolean.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "TriangleSelector.hpp"
 #include "ObjectID.hpp"
@@ -402,6 +403,185 @@ const ModelObjectPtrs& Cut::perform_with_plane()
     finalize(cut_object_ptrs, saved_paintings);
 
     BOOST_LOG_TRIVIAL(trace) << "ModelObject::cut - end";
+
+    return m_model.objects;
+}
+
+// Split a solid volume into 2 LP pieces:
+//   upper — the portion above the cut plane (Z>0) within the XY limit area ("cut-off piece")
+//   lower — everything else: below the plane within the limit area PLUS all outside the limit area
+//
+// Algorithm:
+//   1. Use CGAL boolean ops to clip the mesh to the XY limit column.  CGAL guarantees manifold
+//      output, which is critical so the non-manifold detector in GLGizmoCut does not trigger mesh
+//      repair (repair clears all painting).
+//   2. Cut the inside portion at Z=0 using cut_mesh.
+//   3. Merge lower-inside + outside into one ITS via its_merge so the remaining piece is a single
+//      volume.  We do NOT use cgal::plus here — sharing a limit-box boundary with opposite normals
+//      causes CGAL to produce scrambled geometry.
+//
+// When keep_as_parts is true both portions are added to upper (same convention as
+// process_solid_part_cut) so that finalize() treats the result as one multi-part object.
+//
+// need_upper / need_lower let the caller skip the slow CGAL minus + its_merge when only one
+// section will survive post_process. Always true in keep_as_parts mode.
+static void process_solid_part_limited_cut(
+    const ModelVolume* volume, const Transform3d& instance_matrix, const Transform3d& cut_matrix,
+    float lp_size, float lp_x_offset, float lp_y_offset,
+    bool keep_as_parts, bool need_upper, bool need_lower,
+    ModelObject* upper, ModelObject* lower)
+{
+    const auto volume_matrix = volume->get_matrix();
+
+    const Transformation cut_transformation = Transformation(cut_matrix);
+    const Transform3d invert_cut_matrix = cut_transformation.get_rotation_matrix().inverse() *
+                                          translation_transform(-1. * cut_transformation.get_offset());
+
+    TriangleMesh mesh(volume->mesh());
+    mesh.transform(invert_cut_matrix * instance_matrix * volume_matrix, true);
+
+    if (mesh.empty())
+        return;
+
+    // lp_size is the frustum radius; the visual square's axis-aligned half-width is lp_size/√2.
+    const BoundingBoxf3 bbox    = mesh.bounding_box();
+    const double        total_z = (bbox.max.z() - bbox.min.z()) + 2.0;
+    const double        hw      = double(lp_size) / M_SQRT2;
+
+    // Build a full-height box in cut space that represents the XY limit column.
+    TriangleMesh limit_box = make_cube(hw * 2.0, hw * 2.0, total_z);
+    limit_box.translate(float(double(lp_x_offset) - hw),
+                        float(double(lp_y_offset) - hw),
+                        float(bbox.min.z() - 1.0));
+
+    TriangleMesh inside_mesh  = mesh;
+    TriangleMesh outside_mesh; // only filled when the lower piece is needed
+    try {
+        MeshBoolean::cgal::intersect(inside_mesh, limit_box);
+        if (need_lower) {
+            outside_mesh = mesh;
+            MeshBoolean::cgal::minus(outside_mesh, limit_box);
+        }
+    } catch (const std::exception& ex) {
+        BOOST_LOG_TRIVIAL(error) << "Limited planar cut CGAL clip failed: " << ex.what();
+        add_cut_volume(mesh, lower, volume, cut_matrix);
+        return;
+    }
+
+    // Cut the inside portion at the LP plane (Z=0).
+    indexed_triangle_set upper_its, lower_its;
+    if (!inside_mesh.empty())
+        cut_mesh(inside_mesh.its, 0.0f, &upper_its, &lower_its);
+
+    // Merge lower-inside + outside into one mesh via its_merge (NOT cgal::plus).
+    // its_merge produces two independent closed sub-meshes with 0 open edges — the slicer
+    // handles multi-body volumes correctly.
+    if (need_lower)
+        its_merge(lower_its, outside_mesh.its);
+
+    TriangleMesh upper_mesh(std::move(upper_its));
+    TriangleMesh lower_mesh(std::move(lower_its));
+
+    if (keep_as_parts) {
+        add_cut_volume(upper_mesh, upper, volume, cut_matrix, "_A");
+        if (!lower_mesh.empty()) {
+            add_cut_volume(lower_mesh, upper, volume, cut_matrix, "_B");
+            upper->volumes.back()->cut_info.is_from_upper = false;
+        }
+        return;
+    }
+
+    if (need_upper)
+        add_cut_volume(upper_mesh, upper, volume, cut_matrix);
+    if (need_lower)
+        add_cut_volume(lower_mesh, lower, volume, cut_matrix);
+}
+
+const ModelObjectPtrs& Cut::perform_with_limited_plane(float lp_size, float lp_x_offset, float lp_y_offset, int lp_section)
+{
+    ModelObject* mo = m_model.objects.front();
+
+    BOOST_LOG_TRIVIAL(trace) << "ModelObject::cut limited planar - start";
+
+    // Two output pieces:
+    //   upper — above the cut plane within the XY limit area (the "cut-off" piece)
+    //   lower — everything else (below the plane within the limit + all outside the limit)
+    ModelObject* upper { nullptr };
+    ModelObject* lower { nullptr };
+
+    mo->clone_for_cut(&upper);
+    mo->clone_for_cut(&lower);
+
+    std::vector<ModelObject*> dowels;
+
+    const auto           instance_matrix     = mo->instances[m_instance]->get_transformation().get_matrix_no_offset();
+    const Transformation cut_transformation  = Transformation(m_cut_matrix);
+    const Transform3d    inverse_cut_matrix  = cut_transformation.get_rotation_matrix().inverse() *
+                                               translation_transform(-1. * cut_transformation.get_offset());
+
+    const bool keep_as_parts = m_attributes.has(ModelObjectCutAttribute::KeepAsParts);
+
+    // Section filter: lp_section 0=both, 1=cut-off only, 2=remaining only. In keep_as_parts
+    // mode both pieces become volumes of the upper object, so we always need both.
+    const bool keep_upper = keep_as_parts || lp_section == 0 || lp_section == 1;
+    const bool keep_lower = keep_as_parts || lp_section == 0 || lp_section == 2;
+
+    std::vector<std::optional<TriangleSelector::SavedPainting>> saved_paintings;
+    for (ModelVolume* volume : mo->volumes) {
+        if (m_attributes.has(ModelObjectCutAttribute::KeepPaint)) {
+            saved_paintings.emplace_back(volume->save_painting());
+            if (saved_paintings.back())
+                saved_paintings.back()->mesh.transform(instance_matrix * volume->get_matrix(), true);
+        }
+
+        volume->reset_extra_facets();
+
+        if (!volume->is_model_part()) {
+            if (volume->cut_info.is_processed) {
+                // With KeepAsParts modifiers go to upper (all parts in one object, same as planar cut).
+                // Without KeepAsParts route entirely to lower so modifiers stay with the main body.
+                if (keep_as_parts)
+                    process_modifier_cut(volume, instance_matrix, inverse_cut_matrix, m_attributes, upper, lower);
+                else
+                    process_modifier_cut(volume, instance_matrix, inverse_cut_matrix, m_attributes, lower, lower);
+            } else {
+                process_connector_cut(volume, instance_matrix, m_cut_matrix, m_attributes, upper, lower, dowels);
+            }
+        } else if (!volume->mesh().empty()) {
+            process_solid_part_limited_cut(volume, instance_matrix, m_cut_matrix,
+                                           lp_size, lp_x_offset, lp_y_offset,
+                                           keep_as_parts, keep_upper, keep_lower,
+                                           upper, lower);
+        }
+    }
+
+    ModelObjectPtrs cut_object_ptrs;
+
+    if (keep_as_parts && !upper->volumes.empty()) {
+        // Both solid portions are already in upper (set by process_solid_part_limited_cut).
+        // Mirror the pattern from perform_with_plane: push only upper, discard lower.
+        reset_instance_transformation(upper, m_instance, m_cut_matrix);
+        cut_object_ptrs.push_back(upper);
+        m_model.objects.push_back(lower);
+    } else {
+        // Use post_process so PlaceOnCut and Flip are applied correctly.
+        post_process(upper, cut_object_ptrs, keep_upper,
+                     m_attributes.has(ModelObjectCutAttribute::PlaceOnCutUpper), false);
+        post_process(lower, cut_object_ptrs, keep_lower,
+                     m_attributes.has(ModelObjectCutAttribute::PlaceOnCutLower), false);
+    }
+
+    if (m_attributes.has(ModelObjectCutAttribute::CreateDowels) && !dowels.empty()) {
+        for (auto dowel : dowels) {
+            reset_instance_transformation(dowel, m_instance);
+            dowel->name += "-Dowel-" + dowel->volumes[0]->name;
+            cut_object_ptrs.push_back(dowel);
+        }
+    }
+
+    finalize(cut_object_ptrs, saved_paintings);
+
+    BOOST_LOG_TRIVIAL(trace) << "ModelObject::cut limited planar - end";
 
     return m_model.objects;
 }

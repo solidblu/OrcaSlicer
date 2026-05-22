@@ -70,8 +70,27 @@ static GLModel::Geometry its_make_line(Vec3f beg_pos, Vec3f end_pos)
     return init_data;
 }
 
+// Generates mesh for the LP square outline (diamond at unit radius, matching the
+// frustum_dowel sectorCount=4 vertex layout used for m_plane.model).
+static void init_from_lp_outline(GLModel& model)
+{
+    GLModel::Geometry init_data;
+    init_data.format = { GLModel::Geometry::EPrimitiveType::LineLoop, GLModel::Geometry::EVertexLayout::P3 };
+    init_data.reserve_vertices(4);
+    init_data.reserve_indices(4);
+
+    init_data.add_vertex(Vec3f( 1.f,  0.f, 0.f));
+    init_data.add_vertex(Vec3f( 0.f,  1.f, 0.f));
+    init_data.add_vertex(Vec3f(-1.f,  0.f, 0.f));
+    init_data.add_vertex(Vec3f( 0.f, -1.f, 0.f));
+    for (unsigned int i = 0; i < 4; ++i)
+        init_data.add_index(i);
+
+    model.init_from(std::move(init_data));
+}
+
 //! -- #ysFIXME those functions bodies are ported from GizmoRotation
-// Generates mesh for a circle 
+// Generates mesh for a circle
 static void init_from_circle(GLModel& model, double radius)
 {
     GLModel::Geometry init_data;
@@ -189,9 +208,11 @@ GLGizmoCut3D::GLGizmoCut3D(GLCanvas3D& parent, const std::string& icon_filename,
     , m_connector_style (int(CutConnectorStyle::Prism))
     , m_connector_shape_id (int(CutConnectorShape::Circle))
 {
-    m_modes = { _u8L("Planar"), _u8L("Dovetail")//, _u8L("Grid")
+    m_modes = { _u8L("Planar"), _u8L("Dovetail"), _u8L("Limited Planar")//, _u8L("Grid")
 //              , _u8L("Radial"), _u8L("Modular")
     };
+
+    m_lp_section_names = { _u8L("Both pieces"), _u8L("Cut-off piece"), _u8L("Remaining piece") };
 
     m_connector_modes = { _u8L("Auto"), _u8L("Manual") };
 
@@ -504,6 +525,14 @@ void GLGizmoCut3D::switch_to_mode(size_t new_mode)
     if (auto oc = m_c->object_clipper()) {
         m_contour_width = CutMode(m_mode) == CutMode::cutTongueAndGroove ? 0.f : 0.4f;
         oc->set_behavior(m_connectors_editing, m_connectors_editing, double(m_contour_width));
+    }
+
+    if (CutMode(new_mode) == CutMode::cutLimitedPlanar) {
+        // initialize size to half the visible plane so it's obviously limited on first open
+        m_lp_size     = float(m_cut_plane_radius_koef * m_radius) * 0.5f;
+        m_lp_x_offset = 0.f;
+        m_lp_y_offset = 0.f;
+        m_lp_section  = 0;
     }
 
     update_plane_model();
@@ -1064,16 +1093,73 @@ void GLGizmoCut3D::render_cut_plane()
     ColorRGBA cp_clr = can_perform_cut() && has_valid_groove() ? CUT_PLANE_DEF_COLOR : CUT_PLANE_ERR_COLOR;
     if (m_mode == size_t(CutMode::cutTongueAndGroove))
         cp_clr.a(cp_clr.a() - 0.1f);
-    m_plane.model.set_color(cp_clr);
 
-    const Transform3d view_model_matrix = camera.get_view_matrix() * translation_transform(m_plane_center) * m_rotation_m;
-    shader->set_uniform("view_model_matrix", view_model_matrix);
-    m_plane.model.render();
+    const Transform3d base_matrix = camera.get_view_matrix() * translation_transform(m_plane_center) * m_rotation_m;
+
+    // Common LP geometry — used by both the plane fill and the outline overlay below.
+    const float       lp_full_radius = float(m_cut_plane_radius_koef * m_radius);
+    const float       lp_scale       = (lp_full_radius > 0.f && m_lp_size > 0.f)
+                                           ? std::min(m_lp_size, lp_full_radius) / lp_full_radius
+                                           : 0.5f;
+    const Transform3d lp_matrix      = base_matrix *
+        translation_transform(Vec3d(double(m_lp_x_offset), double(m_lp_y_offset), 0.0)) *
+        scale_transform(Vec3d(lp_scale, lp_scale, 1.0));
+
+    if (CutMode(m_mode) == CutMode::cutLimitedPlanar) {
+        // Ghost: faint full-size plane so the user can see the total cross-section extent
+        ColorRGBA ghost_clr = cp_clr;
+        ghost_clr.a(0.12f);
+        m_plane.model.set_color(ghost_clr);
+        shader->set_uniform("view_model_matrix", base_matrix);
+        m_plane.model.render();
+
+        // Two-pass: render upper face (CYAN) and lower face (MAGENTA) to show
+        // which side of the cut each face belongs to, matching the model color split.
+        const bool fwd = is_looking_forward();
+        ColorRGBA upper_clr = UPPER_PART_COLOR;
+        upper_clr.a(cp_clr.a());
+        ColorRGBA lower_clr = LOWER_PART_COLOR;
+        lower_clr.a(cp_clr.a());
+
+        // Push the LP plane slightly toward the viewer so it wins the depth test
+        // against the same-depth ghost plane.
+        glsafe(::glEnable(GL_POLYGON_OFFSET_FILL));
+        glsafe(::glPolygonOffset(-1.f, -1.f));
+
+        shader->set_uniform("view_model_matrix", lp_matrix);
+        glsafe(::glEnable(GL_CULL_FACE));
+
+        glsafe(::glCullFace(GL_BACK));   // front face toward camera = above-cut side
+        m_plane.model.set_color(fwd ? upper_clr : lower_clr);
+        m_plane.model.render();
+
+        glsafe(::glCullFace(GL_FRONT));  // back face away from camera = below-cut side
+        m_plane.model.set_color(fwd ? lower_clr : upper_clr);
+        m_plane.model.render();
+
+        glsafe(::glDisable(GL_POLYGON_OFFSET_FILL));
+        glsafe(::glCullFace(GL_BACK));   // restore default before function-level re-enable
+    } else {
+        m_plane.model.set_color(cp_clr);
+        shader->set_uniform("view_model_matrix", base_matrix);
+        m_plane.model.render();
+    }
 
     glsafe(::glEnable(GL_CULL_FACE));
     glsafe(::glDisable(GL_BLEND));
 
     shader->stop_using();
+
+    // LP outline: solid bright diamond around the LP square so the boundary stays
+    // legible even when the tinted plane blends with the model color. m_lp_outline
+    // is unit-radius, so scale by the absolute LP radius (full_radius * lp_scale).
+    if (CutMode(m_mode) == CutMode::cutLimitedPlanar && m_lp_outline.is_initialized()) {
+        const double abs_radius = double(lp_full_radius) * double(lp_scale);
+        const Transform3d outline_matrix = base_matrix *
+            translation_transform(Vec3d(double(m_lp_x_offset), double(m_lp_y_offset), 0.0)) *
+            scale_transform(Vec3d(abs_radius, abs_radius, 1.0));
+        render_line(m_lp_outline, ColorRGBA::WHITE(), outline_matrix, 0.4f);
+    }
 }
 
 static double get_half_size(double size)
@@ -1344,10 +1430,17 @@ void GLGizmoCut3D::on_load(cereal::BinaryInputArchive& ar)
     float groove_angle;
     float groove_depth_tolerance;
     float groove_width_tolerance;
+    float lp_size;
+    float lp_x_offset;
+    float lp_y_offset;
+    int   lp_section;
+    bool  lp_place_on_cut_upper;
+    bool  lp_place_on_cut_lower;
 
     ar( m_keep_upper, m_keep_lower, m_rotate_lower, m_rotate_upper, m_hide_cut_plane, mode, m_connectors_editing,
         m_ar_plane_center, m_rotation_m,
-        groove_depth, groove_width, groove_flaps_angle, groove_angle, groove_depth_tolerance, groove_width_tolerance);
+        groove_depth, groove_width, groove_flaps_angle, groove_angle, groove_depth_tolerance, groove_width_tolerance,
+        lp_size, lp_x_offset, lp_y_offset, lp_section, lp_place_on_cut_upper, lp_place_on_cut_lower);
 
     m_start_dragging_m = m_rotation_m;
 
@@ -1362,7 +1455,7 @@ void GLGizmoCut3D::on_load(cereal::BinaryInputArchive& ar)
             !is_approx(m_groove.flaps_angle    , groove_flaps_angle) ||
             !is_approx(m_groove.angle          , groove_angle) ||
             !is_approx(m_groove.depth_tolerance, groove_depth_tolerance) ||
-            !is_approx(m_groove.width_tolerance, groove_width_tolerance) ) 
+            !is_approx(m_groove.width_tolerance, groove_width_tolerance) )
         {
             m_groove.depth          = groove_depth;
             m_groove.width          = groove_width;
@@ -1374,15 +1467,24 @@ void GLGizmoCut3D::on_load(cereal::BinaryInputArchive& ar)
         }
         reset_cut_by_contours();
     }
+    else if (CutMode(m_mode) == CutMode::cutLimitedPlanar) {
+        m_lp_size               = lp_size;
+        m_lp_x_offset           = lp_x_offset;
+        m_lp_y_offset           = lp_y_offset;
+        m_lp_section            = lp_section;
+        m_lp_place_on_cut_upper = lp_place_on_cut_upper;
+        m_lp_place_on_cut_lower = lp_place_on_cut_lower;
+    }
 
     m_parent.request_extra_frame();
 }
 
 void GLGizmoCut3D::on_save(cereal::BinaryOutputArchive& ar) const
-{ 
+{
     ar( m_keep_upper, m_keep_lower, m_rotate_lower, m_rotate_upper, m_hide_cut_plane, m_mode, m_connectors_editing,
         m_ar_plane_center, m_start_dragging_m,
-        m_groove.depth, m_groove.width, m_groove.flaps_angle, m_groove.angle, m_groove.depth_tolerance, m_groove.width_tolerance);
+        m_groove.depth, m_groove.width, m_groove.flaps_angle, m_groove.angle, m_groove.depth_tolerance, m_groove.width_tolerance,
+        m_lp_size, m_lp_x_offset, m_lp_y_offset, m_lp_section, m_lp_place_on_cut_upper, m_lp_place_on_cut_lower);
 }
 
 std::string GLGizmoCut3D::on_get_name() const
@@ -1982,6 +2084,8 @@ void GLGizmoCut3D::init_rendering_items()
 {
     if (!m_grabber_connection.is_initialized())
         m_grabber_connection.init_from(its_make_line(Vec3f::Zero(), Vec3f::UnitZ()));
+    if (!m_lp_outline.is_initialized())
+        init_from_lp_outline(m_lp_outline);
     if (!m_circle.is_initialized())
         init_from_circle(m_circle, m_grabber_radius);
     if (!m_scale.is_initialized())
@@ -2854,7 +2958,7 @@ void GLGizmoCut3D::render_cut_plane_input_window(CutConnectors &connectors, floa
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(6.0f, 4.0f * f_scale));
     
     CutMode mode = CutMode(m_mode);
-    if (mode == CutMode::cutPlanar || mode == CutMode::cutTongueAndGroove) {
+    if (mode == CutMode::cutPlanar || mode == CutMode::cutTongueAndGroove || mode == CutMode::cutLimitedPlanar) {
 
         m_imgui->disabled_begin(has_connectors);
         if (render_cut_mode_combo())
@@ -2905,8 +3009,43 @@ void GLGizmoCut3D::render_cut_plane_input_window(CutConnectors &connectors, floa
             ImGui::SameLine(m_label_width);
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(2) << (m_groove_gap + groove_width);
-            m_imgui->text(oss.str() + "mm");        
+            m_imgui->text(oss.str() + "mm");
             m_imgui->disabled_end();
+        }
+        else if (mode == CutMode::cutLimitedPlanar) {
+            ImGui::Separator();
+            m_imgui->text_colored(ImGuiWrapper::COL_ORANGE_LIGHT, _u8L("Limited plane") + ": ");
+
+            const float max_plane_size = float(m_radius * m_cut_plane_radius_koef);
+            if (m_lp_size <= 0.f || m_lp_size > max_plane_size)
+                m_lp_size = max_plane_size * 0.5f;
+
+            if (render_slider_input(_u8L("Plane size"), m_lp_size, 1.f, max_plane_size))
+                update_clipper();
+
+            auto render_lp_offset = [this](const std::string& label, float& val) -> bool {
+                const float max_v  = float(m_radius * m_cut_plane_radius_koef);
+                float v = val, old_v = val;
+                const std::string fmt = "%.2f  " + _u8L("mm");
+                const double sw  = 0.42 * m_editing_window_width;
+                const double gap = 0.01 * m_editing_window_width;
+                const double iw  = 0.29 * m_editing_window_width;
+                ImGui::AlignTextToFramePadding();
+                m_imgui->text(label);
+                ImGui::SameLine(m_label_width);
+                ImGui::PushItemWidth(sw);
+                m_imgui->bbl_slider_float_style(("##" + label).c_str(), &v, -max_v, max_v, fmt.c_str());
+                ImGui::SameLine(m_label_width + sw + gap);
+                ImGui::PushItemWidth(iw);
+                ImGui::BBLDragFloat(("##input_" + label).c_str(), &v, 0.05f, -max_v, max_v, fmt.c_str());
+                if (!is_approx(old_v, v)) { val = v; return true; }
+                return false;
+            };
+
+            if (render_lp_offset(_u8L("X offset"), m_lp_x_offset))
+                update_clipper();
+            if (render_lp_offset(_u8L("Y offset"), m_lp_y_offset))
+                update_clipper();
         }
 
         ImGui::Separator();
@@ -2951,34 +3090,53 @@ void GLGizmoCut3D::render_cut_plane_input_window(CutConnectors &connectors, floa
         };
 
         m_imgui->text(_L("After cut") + ": ");
-        render_part_action_line(_L("Upper part"), "##upper", m_keep_upper, m_place_on_cut_upper, m_rotate_upper);
-        render_part_action_line(_L("Lower part"), "##lower", m_keep_lower, m_place_on_cut_lower, m_rotate_lower);
-
-        m_imgui->disabled_begin(has_connectors || m_part_selection.valid() || mode == CutMode::cutTongueAndGroove);
-
-            if (m_part_selection.valid())
-                m_keep_as_parts = false;
-
+        if (mode == CutMode::cutLimitedPlanar) {
+            ImGuiWrapper::push_combo_style(m_parent.get_scale());
+            int lp_sec = m_lp_section;
+            if (m_imgui->combo(_u8L("Output"), m_lp_section_names, lp_sec, 0, m_label_width, m_control_width))
+                m_lp_section = lp_sec;
+            ImGuiWrapper::pop_combo_style();
+            m_imgui->bbl_checkbox(_L("Place cut-off on cut"), m_lp_place_on_cut_upper);
+            m_imgui->bbl_checkbox(_L("Place remaining on cut"), m_lp_place_on_cut_lower);
             m_imgui->bbl_checkbox(_L("Cut to parts"), m_keep_as_parts);
-            if (m_keep_as_parts) {
-                m_keep_upper = m_keep_lower = true;
-                m_place_on_cut_upper = m_place_on_cut_lower = false;
-                m_rotate_upper = m_rotate_lower = false;
-            }
-        m_imgui->disabled_end();
+        } else {
+            render_part_action_line(_L("Upper part"), "##upper", m_keep_upper, m_place_on_cut_upper, m_rotate_upper);
+            render_part_action_line(_L("Lower part"), "##lower", m_keep_lower, m_place_on_cut_lower, m_rotate_lower);
+
+            m_imgui->disabled_begin(has_connectors || m_part_selection.valid() || mode == CutMode::cutTongueAndGroove);
+
+                if (m_part_selection.valid())
+                    m_keep_as_parts = false;
+
+                m_imgui->bbl_checkbox(_L("Cut to parts"), m_keep_as_parts);
+                if (m_keep_as_parts) {
+                    m_keep_upper = m_keep_lower = true;
+                    m_place_on_cut_upper = m_place_on_cut_lower = false;
+                    m_rotate_upper = m_rotate_lower = false;
+                }
+            m_imgui->disabled_end();
+        }
     }
 
     ImGui::Separator();
     
     render_tooltip_button(x, y);
 
-    if (mode == CutMode::cutPlanar) {
+    if (mode == CutMode::cutPlanar || mode == CutMode::cutLimitedPlanar) {
         ImGui::SameLine();
         m_imgui->disabled_begin(is_cut_plane_init && !has_connectors);
         if (m_imgui->button(_L("Reset"), _L("Reset cutting plane and remove connectors"))) {
             Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Reset Cut", UndoRedo::SnapshotType::GizmoAction);
             reset_cut_plane();
             reset_connectors();
+            if (mode == CutMode::cutLimitedPlanar) {
+                m_lp_size               = float(m_cut_plane_radius_koef * m_radius) * 0.5f;
+                m_lp_x_offset           = 0.f;
+                m_lp_y_offset           = 0.f;
+                m_lp_section            = 0;
+                m_lp_place_on_cut_upper = false;
+                m_lp_place_on_cut_lower = false;
+            }
         }
         m_imgui->disabled_end();
     }
@@ -3538,8 +3696,9 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
         // This shall delete the part selection class and deallocate the memory.
         ScopeGuard part_selection_killer([this]() { m_part_selection = PartSelection(); });
 
-        const bool cut_with_groove = CutMode(m_mode) == CutMode::cutTongueAndGroove;
-        const bool cut_by_contour = !cut_with_groove && m_part_selection.valid();
+        const bool cut_with_groove         = CutMode(m_mode) == CutMode::cutTongueAndGroove;
+        const bool cut_with_limited_plane  = CutMode(m_mode) == CutMode::cutLimitedPlanar;
+        const bool cut_by_contour          = !cut_with_groove && !cut_with_limited_plane && m_part_selection.valid();
 
         ModelObject* cut_mo = cut_by_contour ? m_part_selection.model_object() : nullptr;
         if (cut_mo)
@@ -3555,24 +3714,25 @@ void GLGizmoCut3D::perform_cut(const Selection& selection)
         wxBusyCursor wait;
 
         const bool keep_painting = GUI::wxGetApp().app_config->get_bool("keep_painting");
-        ModelObjectCutAttributes attributes = only_if(has_connectors ? true : m_keep_upper, ModelObjectCutAttribute::KeepUpper) |
-                                              only_if(has_connectors ? true : m_keep_lower, ModelObjectCutAttribute::KeepLower) |
+        ModelObjectCutAttributes attributes = only_if(has_connectors || cut_with_limited_plane ? true : m_keep_upper, ModelObjectCutAttribute::KeepUpper) |
+                                              only_if(has_connectors || cut_with_limited_plane ? true : m_keep_lower, ModelObjectCutAttribute::KeepLower) |
                                               only_if(has_connectors ? false : m_keep_as_parts, ModelObjectCutAttribute::KeepAsParts) |
-                                              only_if(m_place_on_cut_upper, ModelObjectCutAttribute::PlaceOnCutUpper) |
-                                              only_if(m_place_on_cut_lower, ModelObjectCutAttribute::PlaceOnCutLower) |
+                                              only_if(cut_with_limited_plane ? m_lp_place_on_cut_upper : m_place_on_cut_upper, ModelObjectCutAttribute::PlaceOnCutUpper) |
+                                              only_if(cut_with_limited_plane ? m_lp_place_on_cut_lower : m_place_on_cut_lower, ModelObjectCutAttribute::PlaceOnCutLower) |
                                               only_if(m_rotate_upper, ModelObjectCutAttribute::FlipUpper) |
                                               only_if(m_rotate_lower, ModelObjectCutAttribute::FlipLower) |
                                               only_if(dowels_count > 0, ModelObjectCutAttribute::CreateDowels) |
-                                              only_if(!has_connectors && !cut_with_groove && cut_mo->cut_id.id().invalid(), ModelObjectCutAttribute::InvalidateCutInfo) |
+                                              only_if(!has_connectors && !cut_with_groove && !cut_with_limited_plane && cut_mo->cut_id.id().invalid(), ModelObjectCutAttribute::InvalidateCutInfo) |
                                               only_if(keep_painting, ModelObjectCutAttribute::KeepPaint);
 
         // update cut_id for the cut object in respect to the attributes
         update_object_cut_id(cut_mo->cut_id, attributes, dowels_count);
 
         Cut cut(cut_mo, instance_idx, get_cut_matrix(selection), attributes);
-        const ModelObjectPtrs& new_objects = cut_by_contour    ? cut.perform_by_contour(mo, m_part_selection.get_cut_parts(), dowels_count):
-                                             cut_with_groove   ? cut.perform_with_groove(m_groove, m_rotation_m, m_groove_count, m_groove_gap, m_radius) :
-                                                                 cut.perform_with_plane();
+        const ModelObjectPtrs& new_objects = cut_by_contour         ? cut.perform_by_contour(mo, m_part_selection.get_cut_parts(), dowels_count) :
+                                             cut_with_groove         ? cut.perform_with_groove(m_groove, m_rotation_m, m_groove_count, m_groove_gap, m_radius) :
+                                             cut_with_limited_plane  ? cut.perform_with_limited_plane(m_lp_size, m_lp_x_offset, m_lp_y_offset, m_lp_section) :
+                                                                       cut.perform_with_plane();
 
         // fix_non_manifold_edges
         {

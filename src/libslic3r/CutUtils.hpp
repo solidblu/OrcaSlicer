@@ -56,6 +56,7 @@ public:
     };
 
     const ModelObjectPtrs& perform_with_plane();
+    const ModelObjectPtrs& perform_with_limited_plane(float lp_size, float lp_x_offset, float lp_y_offset, int lp_section);
     const ModelObjectPtrs& perform_by_contour(const ModelObject* src_object, std::vector<Part> parts, int dowels_count);
     const ModelObjectPtrs& perform_with_groove(const Groove&      groove,
                                                const Transform3d& rotation_m,
