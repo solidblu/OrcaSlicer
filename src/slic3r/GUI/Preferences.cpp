@@ -1861,6 +1861,9 @@ void PreferencesDialog::create_items()
     auto item_keep_painting    = create_item_checkbox(_L("(Experimental) Keep painted feature after mesh change"), _L("Attempt to keep painted features (color/seam/support/fuzzy etc.) after changing the object mesh (such as cut/reload from disk/simplify/fix etc.)\nHighly experimental! Slow and may create artifact."), "keep_painting");
     g_sizer->Add(item_keep_painting);
 
+    auto item_propagate_cut_paint = create_item_checkbox(_L("(Experimental) Preserve painted features after planar cut"), _L("Preserve paint annotations (support/seam/color/fuzzy) through planar cuts using fast per-face source tracking.\nDovetail cuts will use the experimental slow method above.\nIf 'Keep painted feature after mesh change' is also enabled, that option takes priority."), "propagate_cut_paint");
+    g_sizer->Add(item_propagate_cut_paint);
+
     g_sizer->Add(create_item_title(_L("Storage")), 1, wxEXPAND);
     auto item_allow_abnormal_storage = create_item_checkbox(_L("Allow Abnormal Storage"), _L("This allows the use of Storage that is marked as abnormal by the Printer.\nUse at your own risk, can cause issues!"), "allow_abnormal_storage");
     g_sizer->Add(item_allow_abnormal_storage);

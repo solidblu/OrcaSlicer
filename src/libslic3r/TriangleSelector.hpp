@@ -45,10 +45,11 @@ using EnforcerBlockerStateMap = std::array<EnforcerBlockerType, (size_t)Enforcer
 class TriangleSelector
 {
 protected:
-    class Triangle;
     struct Vertex;
 
 public:
+    class Triangle;
+
     enum CursorType {
         CIRCLE,
         SPHERE,
@@ -336,6 +337,8 @@ public:
     // Get edges around the selected area by seed fill.
     std::vector<Vec2i32> get_seed_fill_contour() const;
 
+    const std::vector<Triangle>& get_triangles() const { return m_triangles; }
+
     // BBS
     void get_facets(std::vector<indexed_triangle_set>& facets_per_type) const;
 
@@ -392,7 +395,7 @@ public:
         const Transform3d& target_transform,
         const std::optional<std::reference_wrapper<const TriangleSplittingData>>& existing_painting);
 
-protected:
+public:
     // Triangle and info about how it's split.
     class Triangle {
     public:
@@ -458,6 +461,7 @@ protected:
         EnforcerBlockerType state;
     };
 
+protected:
     struct Vertex {
         explicit Vertex(const stl_vertex& vert)
             : v{vert},
